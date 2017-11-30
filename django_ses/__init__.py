@@ -1,13 +1,12 @@
+import botocore
 import logging
-
-from django.core.mail.backends.base import BaseEmailBackend
-from django_ses import settings
-
-from boto.regioninfo import RegionInfo
-from boto.ses import SESConnection
-
+from boto3.session import Session
 from datetime import datetime, timedelta
+from django.conf import settings as django_settings
+from django.core.mail.backends.base import BaseEmailBackend
 from time import sleep
+
+from django_ses import settings
 
 
 # When changing this, remember to change it in setup.py
@@ -48,29 +47,22 @@ class SESBackend(BaseEmailBackend):
     """A Django Email backend that uses Amazon's Simple Email Service.
     """
 
-    def __init__(self, fail_silently=False, aws_access_key=None,
-                 aws_secret_key=None, aws_region_name=None,
-                 aws_region_endpoint=None, aws_auto_throttle=None,
-                 dkim_domain=None, dkim_key=None, dkim_selector=None,
-                 dkim_headers=None, proxy=None, proxy_port=None,
-                 proxy_user=None, proxy_pass=None, **kwargs):
+    def __init__(self, fail_silently=False, **kwargs):
 
         super(SESBackend, self).__init__(fail_silently=fail_silently, **kwargs)
-        self._access_key_id = aws_access_key or settings.ACCESS_KEY
-        self._access_key = aws_secret_key or settings.SECRET_KEY
-        self._region = RegionInfo(
-            name=aws_region_name or settings.AWS_SES_REGION_NAME,
-            endpoint=aws_region_endpoint or settings.AWS_SES_REGION_ENDPOINT)
-        self._throttle = aws_auto_throttle or settings.AWS_SES_AUTO_THROTTLE
-        self._proxy = proxy or settings.AWS_SES_PROXY
-        self._proxy_port = proxy_port or settings.AWS_SES_PROXY_PORT
-        self._proxy_user = proxy_user or settings.AWS_SES_PROXY_USER
-        self._proxy_pass = proxy_pass or settings.AWS_SES_PROXY_PASS
 
-        self.dkim_domain = dkim_domain or settings.DKIM_DOMAIN
-        self.dkim_key = dkim_key or settings.DKIM_PRIVATE_KEY
-        self.dkim_selector = dkim_selector or settings.DKIM_SELECTOR
-        self.dkim_headers = dkim_headers or settings.DKIM_HEADERS
+        self.session = Session(
+            aws_access_key_id = settings.ACCESS_KEY,
+            aws_secret_access_key = settings.SECRET_KEY,
+            region_name = settings.AWS_SES_REGION_NAME
+        )
+
+        self._throttle = settings.AWS_SES_AUTO_THROTTLE
+
+        self.dkim_domain = settings.DKIM_DOMAIN
+        self.dkim_key = settings.DKIM_PRIVATE_KEY
+        self.dkim_selector = settings.DKIM_SELECTOR
+        self.dkim_headers = settings.DKIM_HEADERS
 
         self.connection = None
 
@@ -82,15 +74,7 @@ class SESBackend(BaseEmailBackend):
             return False
 
         try:
-            self.connection = SESConnection(
-                aws_access_key_id=self._access_key_id,
-                aws_secret_access_key=self._access_key,
-                region=self._region,
-                proxy=self._proxy,
-                proxy_port=self._proxy_port,
-                proxy_user=self._proxy_user,
-                proxy_pass=self._proxy_pass,
-            )
+            self.connection = self.session.client('ses')
         except:
             if not self.fail_silently:
                 raise
@@ -99,7 +83,6 @@ class SESBackend(BaseEmailBackend):
         """Close any open HTTP connections to the API server.
         """
         try:
-            self.connection.close()
             self.connection = None
         except:
             if not self.fail_silently:
@@ -118,30 +101,7 @@ class SESBackend(BaseEmailBackend):
             return
 
         num_sent = 0
-        source = settings.AWS_SES_RETURN_PATH
         for message in email_messages:
-            # SES Configuration sets. If the AWS_SES_CONFIGURATION_SET setting
-            # is not None, append the appropriate header to the message so that
-            # SES knows which configuration set it belongs to.
-            #
-            # If settings.AWS_SES_CONFIGURATION_SET is a callable, pass it the
-            # message object and dkim settings and expect it to return a string
-            # containing the SES Configuration Set name.
-            if (settings.AWS_SES_CONFIGURATION_SET and
-                'X-SES-CONFIGURATION-SET' not in message.extra_headers):
-                if callable(settings.AWS_SES_CONFIGURATION_SET):
-                    message.extra_headers[
-                        'X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET(
-                            message,
-                            dkim_domain=self.dkim_domain,
-                            dkim_key=self.dkim_key,
-                            dkim_selector=self.dkim_selector,
-                            dkim_headers=self.dkim_headers
-                        )
-                else:
-                    message.extra_headers[
-                        'X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET
-
             # Automatic throttling. Assumes that this is the only SES client
             # currently operating. The AWS_SES_AUTO_THROTTLE setting is a
             # factor to apply to the rate limit, with a default of 0.5 to stay
@@ -191,37 +151,29 @@ class SESBackend(BaseEmailBackend):
 
             try:
                 response = self.connection.send_raw_email(
-                    source=source or message.from_email,
-                    destinations=message.recipients(),
-                    raw_message=dkim_sign(message.message().as_string(),
-                                          dkim_key=self.dkim_key,
-                                          dkim_domain=self.dkim_domain,
-                                          dkim_selector=self.dkim_selector,
-                                          dkim_headers=self.dkim_headers)
+                    Source = django_settings.DEFAULT_FROM_EMAIL,
+                    Destinations = message.recipients(),
+                    RawMessage = { 'Data': dkim_sign(
+                        message.message().as_string(),
+                        dkim_key=self.dkim_key,
+                        dkim_domain=self.dkim_domain,
+                        dkim_selector=self.dkim_selector,
+                        dkim_headers=self.dkim_headers
+                    )}
                 )
-                message.extra_headers['status'] = 200
-                message.extra_headers['message_id'] = response[
-                    'SendRawEmailResponse']['SendRawEmailResult']['MessageId']
-                message.extra_headers['request_id'] = response[
-                    'SendRawEmailResponse']['ResponseMetadata']['RequestId']
-                num_sent += 1
-                if 'X-SES-CONFIGURATION-SET' in message.extra_headers:
-                    logger.debug(u"send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}' ses-configuration-set='{}'".format(
-                        message.from_email,
-                        ", ".join(message.recipients()),
-                        message.extra_headers['message_id'],
-                        message.extra_headers['request_id'],
-                        message.extra_headers['X-SES-CONFIGURATION-SET']
-                    ))
-                else:
-                    logger.debug(u"send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}'".format(
-                        message.from_email,
-                        ", ".join(message.recipients()),
-                        message.extra_headers['message_id'],
-                        message.extra_headers['request_id']
-                    ))
 
-            except SESConnection.ResponseError as err:
+                message.extra_headers['status'] = response['ResponseMetadata']['HTTPStatusCode']
+                message.extra_headers['message_id'] = response['MessageId']
+                message.extra_headers['request_id'] = response['ResponseMetadata']['RequestId']
+                num_sent += 1
+                logger.debug(u"send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}'".format(
+                    message.from_email,
+                    ", ".join(message.recipients()),
+                    message.extra_headers['message_id'],
+                    message.extra_headers['request_id']
+                ))
+
+            except botocore.exceptions.ClientError as err:
                 # Store failure information so to post process it if required
                 error_keys = ['status', 'reason', 'body', 'request_id',
                               'error_code', 'error_message']
@@ -236,8 +188,8 @@ class SESBackend(BaseEmailBackend):
         return num_sent
 
     def get_rate_limit(self):
-        if self._access_key_id in cached_rate_limits:
-            return cached_rate_limits[self._access_key_id]
+        if settings.ACCESS_KEY in cached_rate_limits:
+            return cached_rate_limits[settings.ACCESS_KEY]
 
         new_conn_created = self.open()
         if not self.connection:
@@ -245,10 +197,9 @@ class SESBackend(BaseEmailBackend):
                 "No connection is available to check current SES rate limit.")
         try:
             quota_dict = self.connection.get_send_quota()
-            max_per_second = quota_dict['GetSendQuotaResponse'][
-                'GetSendQuotaResult']['MaxSendRate']
+            max_per_second = quota_dict['MaxSendRate']
             ret = float(max_per_second)
-            cached_rate_limits[self._access_key_id] = ret
+            cached_rate_limits[settings.ACCESS_KEY] = ret
             return ret
         finally:
             if new_conn_created:
